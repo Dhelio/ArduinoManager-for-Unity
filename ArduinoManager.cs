@@ -115,9 +115,6 @@ namespace REPLAYSRL.IO {
         private static System.Collections.Concurrent.ConcurrentQueue<string> outgoingQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
         private static Thread threadedConnection;
 
-        //Variabili di controllo
-        private static volatile uint coins;
-
         //---------------------------------------------------------------------------------- VARIABILI PUBBLICHE
 
         /// <summary>
@@ -192,10 +189,7 @@ namespace REPLAYSRL.IO {
                     string incoming = seriale.ReadLine();
                     if (incoming.Length > 0 && incoming != null) {
                         Utilities.LogD(TAG, "Ricevuto messaggio da arduino ["+incoming+"]");
-                        if (incoming.Contains("g")) {
-                            coins++;
-                            has_Coins = true;
-                        }
+                        //Do something with this data here.
                     }
                     //OUT ASYNC
                     if (outgoingQueue.TryDequeue(out string msg))
