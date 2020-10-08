@@ -125,10 +125,6 @@ namespace REPLAYSRL.IO {
         /// </summary>
         public static bool has_Started { get; private set; }
         /// <summary>
-        /// Se ha correntemente dei gettoni in memoria
-        /// </summary>
-        public static bool has_Coins { get; private set; }
-        /// <summary>
         /// Se il thread è connesso correntemente con Arduino
         /// </summary>
         public static bool has_Connected { get; private set; }
