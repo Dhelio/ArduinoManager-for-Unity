@@ -15,7 +15,7 @@ using Cysharp.Threading.Tasks;
 public class Utilities : Application {
 
     //Costanti
-    private static readonly AndroidJavaObject ajo = new AndroidJavaObject("biz.replay.unityutils.UnityUtils");
+    private static readonly AndroidJavaObject ajo = new AndroidJavaObject("somepackage.unityutils.UnityUtils");
     public static volatile bool isDebug = (Debug.isDebugBuild || isEditor);
 
     public const string AppName = "AmazingApp";
