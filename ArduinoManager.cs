@@ -1,197 +1,285 @@
-using System.IO.Ports; //This library requires .NET 4.x, not its subset.
+using System;
+using System.IO;
+using System.IO.Ports; //Questa libreria di .NET richiede di utilizzare la versione 4.x di .NET in Unity, e non il suo subset 2.x!
 using System.Threading;
-using System.Collections.Concurrent;
-using UnityEngine;
 
-namespace HARDWARE.IO {
+/// <summary>
+/// Classe per la gestione della comunicazione di Unity con Arduino.
+/// </summary>
 
-    public class ArduinoManager : MonoBehaviour {
+namespace REPLAYSRL.IO {
 
-       //---------------------------------------------------------------------------------- PRIVATE VARIABLES
+    public static class ArduinoManager {
 
-        private ConcurrentQueue<string> queue = new ConcurrentQueue<string>(); //Thread safe Q for the production and consumption of messages
-        private SerialPort seriale;
-        private Thread connessione = null; //Producer thread
-        private Thread inputParser = null; //Consumer thread
-        private readonly int baudrate = 9600;
-        private readonly int timeout = -1;
+        //---------------------------------------------------------------------------------- CLASSI
 
-        private string currentCommand = "";
-        private string outgoing = null;
+        /// <summary>
+        /// Personalizzazione della classe serial port.
+        /// </summary>
+        /// <description>
+        /// Siccome la classe SerialPort risale all'età della pietra, quando le porte seriali erano fissate sui computer e non si potevano disconnettere, 
+        /// non esiste un modo per capire se il dispositivo dall'altra parte è stato disconnesso all'improvviso.
+        /// Il modo in cui SerialPort funziona è creando, quando si fa Open, un worker thread che controlla diversi eventi (DataReceived, ErrorReceived,...)
+        /// Se il dispositivo dall'altra parte viene disconnesso o muore questo ha il risultato di far venire un coccolone al thread (che crasha), e siccome
+        /// è un thread non si può chiudere dentro un try/catch.
+        /// Obbligando il Garbage collector a NON utilizzare il finalizzatore (l'analogo in C# del distruttore di C++) quando si apre la porta ed
+        /// a registrarlo quando si chiude la porta, si può obbligare lo stesso a lanciare una eccezione quando non vede più l'accesso a BaseStream.
+        /// Quindi quando si prende questa eccezione, IN TEORIA, basterebbe chiudere la porta, farne il Dispose, settare a null e tentare disperatamente
+        /// di riaprire la connessione.
+        /// </description>
+        class BetterSerialPort : SerialPort {
 
-        //Control Variables
-		private volatile bool pin0 = false;
-		private volatile bool pin1 = false;
-		private volatile bool pin2 = false;
-		private volatile bool pin3 = false;
-		private volatile bool pin4 = false;
-		private volatile bool pin5 = false;
-		private volatile bool pin6 = false;
-		private volatile bool pin7 = false;
-		private volatile bool pin8 = false;
-        private volatile uint missedInputs = 0;
+            private Stream baseStream;
 
-#if UNITY_EDITOR 
-        [Header("Editor Only Fields")]
-        [Tooltip("Just for testing purposes. String should be the COM port where arduino is connected. Default value is COM11 if empty")]
-        [SerializeField] private string portaArduino = "";
-#endif
+            /// <summary>
+            /// Crea una nuova istanza di BetterSerialPort
+            /// </summary>
+            /// <param name="PortName">Il nome della porta (COM su Windows, ttyACM su Android & Ubuntu)</param>
+            /// <param name="Baudrate">Il baudrate a cui inizializzare la comunicazione</param>
+            public BetterSerialPort(string PortName, int Baudrate) : base(PortName, Baudrate) { }
 
-        //---------------------------------------------------------------------------------- PUBLIC VARIABLES
+            /// <summary>
+            /// Apre una connessione sulla porta corrente senza inizializzarne il finalizzatore
+            /// </summary>
+            public new void Open() {
+                try {
+                    if (!base.IsOpen) {
+                        base.Open();
+                        baseStream = BaseStream;
+                        GC.SuppressFinalize(this.BaseStream);
+                    }
+                } catch (Exception e) {
+                    Utilities.LogD(TAG,"Errore durante l'apertura della porta [" + e + "]");
+                }
+            }
 
-        public static ArduinoManager Instance; //Singleton instance
+            /// <summary>
+            /// Flush dello BaseStream per eventuali \n rimasti in memoria
+            /// </summary>
+            public void Clear() {
+                try {
+                    if (base.IsOpen) {
+                        baseStream.Flush();
+                    }
+                } catch (Exception e) {
+                    Utilities.LogE(TAG,"Clear error ["+e+"]");
+                }
+            }
+
+            /// <summary>
+            /// Chiude la porta ed avvia il garbage collector sullo stream
+            /// </summary>
+            public new void Close() {
+                if (base.IsOpen) {
+                    GC.ReRegisterForFinalize(this.BaseStream);
+                    base.Close();
+                }
+            }
+
+            /// <summary>
+            /// Si libera della porta
+            /// </summary>
+            public new void Dispose() {
+                Dispose(true);
+            }
+
+            protected override void Dispose(bool disposing) {
+
+                //Chiama il metodo base di Dispose per il Container
+                if (disposing && (base.Container != null)) {
+                    base.Container.Dispose();
+                }
+                //L'atto di chiudere lo stream per una porta già chiusa lancia una eccezione
+                try {
+                    if (baseStream != null && baseStream.CanRead) {
+                        baseStream.Close();
+                        GC.ReRegisterForFinalize(baseStream);
+                    }
+                } catch (NullReferenceException e) {
+                    Utilities.LogD(TAG,"Bug con la chiusura della porta [" + e + "]");
+                } catch (Exception e) {
+                    Utilities.LogD(TAG,"Bug con la chiusura della porta [" + e + "]");
+                }
+                base.Dispose(disposing);
+            }
+        }
+
+        //---------------------------------------------------------------------------------- VARIABILI PRIVATE
+
+        private const string TAG = "ArduinoManager";
+
+        private static readonly int baudrate = 9600;
+        private static readonly int timeout = -1;
+
+        private static BetterSerialPort seriale;
+        private static System.Collections.Concurrent.ConcurrentQueue<string> outgoingQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        private static Thread threadedConnection;
+
+        //Variabili di controllo
+        private static volatile uint coins;
+
+        //---------------------------------------------------------------------------------- VARIABILI PUBBLICHE
+
+        /// <summary>
+        /// Se ha avviato o no il thread per la connessione
+        /// </summary>
+        public static bool has_Started { get; private set; }
+        /// <summary>
+        /// Se ha correntemente dei gettoni in memoria
+        /// </summary>
+        public static bool has_Coins { get; private set; }
+        /// <summary>
+        /// Se il thread è connesso correntemente con Arduino
+        /// </summary>
+        public static bool has_Connected { get; private set; }
 
         //---------------------------------------------------------------------------------- FUNZIONI PRIVATE
 
         /// <summary>
-        /// Multithreaded connection phase
+        /// DEPRECATA. Funzione che viene chiamata dall'evento SerialDataReceivedEvent. NON FUNZIONA CON UNITY PER UN BUG NOTO LORO
         /// </summary>
-        private void MultithreadedConnection() {
-            bool has_Connected = false;
+        private static void ParseData(object sender, SerialDataReceivedEventArgs e) {
+            string data = ((BetterSerialPort)sender).ReadExisting();
+            Utilities.LogD(TAG,"Data Received: [" + data + "]");
+            if (data.Contains("g")) {
+                coins++;
+            }
+            
+        }
+
+        /// <summary>
+        /// Fase di connessione.
+        /// </summary>
+        private static void ThreadedConnection() {
+            Utilities.LogD(TAG,"In attesa di connessione...");
             do {
-                string[] porte = SerialPort.GetPortNames(); //Obtains the ports list from OS
-                for (int i = 0; i < porte.Length; i++) { //Go through the port list
-#if !UNITY_EDITOR
-                    if (porte[i].Contains("ACM")) { //Arduino uses the abstract control model (ACM), so for linux based os ports start with ACM, not COM.
-#else
-                    if (portaArduino == "") portaArduino = "COM11";
-                    if (porte[i].Contains(portaArduino)) { 
-#endif
-                        seriale = new SerialPort(porte[i], baudrate);
-                        seriale.ReadTimeout = timeout;
-                        seriale.Handshake = Handshake.None; 
-                        seriale.DtrEnable = true; //Enable the data terminal ready (DTR) to signal that the device is ready to communicate.
-                        if (seriale.IsOpen) {
-                            //@IMPLEMENT exception
-                        }
-                        else {
-                            try {
-                                seriale.Open(); 
-                                char c = 'R'; //A start char that I send to my arduino to start the loop
-                                seriale.Write(c.ToString()); //Write to arduino
-                                string ack = seriale.ReadLine(); //Reads from arduino. This call is blocking (thus the thread)
-                                if (ack.Contains("ACK")) { //If arduino answers with ACK, then we're talking to the right arduino.
-                                    has_Connected = true;
-                                    i = porte.Length;
+                has_Connected = false;
+                while (!has_Connected) {
+                    string[] porte = SerialPort.GetPortNames(); //Ottiene la lista dei nomi delle porte correntemente utilizzate dal sistema operativo
+                    for (int i = 0; i < porte.Length; i++) {
+                        Utilities.LogD(TAG, "Presente porta: " + porte[i]);
+                    }
+                    for (int i = 0; i < porte.Length; i++) { //Scorre le porte alla ricerca di quella giusta
+                        if (porte != null)
+                            if (porte[i].Contains("ACM") || porte[i].Contains("COM")) { //Arduino usa l'abstract control model (ACM), per cui in linux based os le porte di arduino iniziano sempre per ACM, non per COM.
+                                seriale = new BetterSerialPort(porte[i], baudrate); //Inizializza la porta scelta al baudrate scelto
+                                seriale.ReadTimeout = timeout; //setta il timeout, cioé la quantità di tempo dopo il quale, se non si riceve risposta, la connessione al dispositivo viene annullata.
+                                seriale.Handshake = Handshake.None; //Nessaun handshaking col dispositivo perché ne faccio uno manuale.
+                                seriale.DtrEnable = true; //Abilito il data terminal ready (DTR) per segnalare ad arduino che il PC è pronto a comunicare.
+                                seriale.Encoding = System.Text.Encoding.ASCII;
+                                //seriale.DataReceived += new SerialDataReceivedEventHandler(ParseData); //Event listener NON FUNZIONA CON UNITY (BUG NOTO)
+                                if (seriale.IsOpen) {
+                                    Utilities.LogD(TAG, "Impossibile aprire arduino: seriale già aperto!");
+                                    seriale.Close();
+                                } else {
+                                    try {
+                                        seriale.Open(); //Apro la comunicazione col seriale
+                                        Utilities.LogD(TAG, "Connesso alla porta [" + porte[i] + "]");
+                                        i = porte.Length;
+                                        has_Connected = true;
+                                    } catch (UnauthorizedAccessException uae) {
+                                        Utilities.LogD(TAG, "Accesso non autorizzato alla porta [" + porte[i] + "] -> [" + uae + "]");
+                                    } catch (ArgumentOutOfRangeException aoore) {
+                                        Utilities.LogD(TAG, "Argument out of range alla porta [" + porte[i] + "] -> [" + aoore + "]");
+                                    } catch (IOException ioe) {
+                                        Utilities.LogD(TAG, "IO exception alla porta [" + porte[i] + "] -> [" + ioe + "]");
+                                    } catch (IndexOutOfRangeException ioore) {
+                                        Utilities.LogD(TAG, "Index out of range -> [" + ioore + "]");
+                                    }
                                 }
                             }
-                            catch (System.UnauthorizedAccessException uae) {
-                                Debug.LogError("UnauthorizedAccessException ["+porte[i]+"] -> [" + uae + "]");
-                            }
-                            catch (System.ArgumentOutOfRangeException aoore) {
-                                Debug.LogError("ArgumentOutOfRangeException [" + porte[i] + "] -> [" + aoore + "]");
-                            }
-                            catch (System.IO.IOException ioe) {
-                                Debug.LogError("IOException [" + porte[i] + "] -> [" + ioe+"]");
-                            }
+                        Thread.Sleep(100);
+                    }
+                }
+                while (seriale != null && seriale.IsOpen) {
+                    //IN
+                    string incoming = seriale.ReadLine();
+                    if (incoming.Length > 0 && incoming != null) {
+                        Utilities.LogD(TAG, "Ricevuto messaggio da arduino ["+incoming+"]");
+                        if (incoming.Contains("g")) {
+                            coins++;
+                            has_Coins = true;
                         }
                     }
+                    //OUT ASYNC
+                    if (outgoingQueue.TryDequeue(out string msg))
+                        if (msg != "" && msg != null) {
+                            Utilities.LogD(TAG, "Invio messaggio ad arduino [" + msg + "]");
+                            try {
+                                seriale.Write(msg);
+                                seriale.Clear();
+                            } catch (InvalidOperationException e) {
+                                Utilities.LogE(TAG, "Operazione non valida [" + e + "]");
+                            } catch (ArgumentNullException e) {
+                                Utilities.LogE(TAG, "Argomento nullo [" + e + "]");
+                            } catch (TimeoutException e) {
+                                Utilities.LogE(TAG, "Timeout [" + e + "]");
+                            }
+                        }
+                    Thread.Sleep(5); //Giusto per non schiattare la board. Tanto 5 ms non si sentono.
                 }
-            } while (!has_Connected);
-            LoopReadWrite();
-        }
-
-        /// <summary>
-        /// Loop for the reading and writing of data. Multithreaded.
-        /// </summary>
-        private void LoopReadWrite() {
-            for (; ; ) { //ciclo infinito
-                currentCommand = seriale.ReadLine(); //Reads from arduino
-                if (currentCommand != null) //If command's null then there's something wrong with the connection
-                    queue.Enqueue(currentCommand); //--
-                if (outgoing != null) { //If there are commands to send...
-                    seriale.Write(outgoing); //...do it
-                    outgoing = null; //null, just to avoid sending the same data.
-                }
-                Thread.Sleep(5); //As to not make the slower devices implode
-            }
-        }
-
-        /// <summary>
-        /// Extrapolation function. Multithreaded.
-        /// </summary>
-        private void MultithreadedParseInput() {
-            for (; ; ) {
-                string s = null; 
-                if (queue.TryDequeue(out s) && s != null) { //we try to dequeue a command, hoping it's not null
-                    string[] splittedData = s.Split("|".ToCharArray()); //Splits the incoming string from arduino
-                    /* 
-						So there are a lot of ways we can structure data from arduino to Unity.
-						In this case, I make a simple string containing the boolean values of the pins. Example:
-						0|1|0|0|0|1|.....
-						Where
-						pin0|pin1|pin2|.....
-						the char | acts as a separator. Not the best way, obvs, but it's just for showing. You can optimize this to your liking.
-					*/
-
-                    pin0 = (splittedData[0]).Contains("1")) ? true : false;
-					pin1 = (splittedData[1]).Contains("1")) ? true : false;
-					pin2 = (splittedData[2]).Contains("1")) ? true : false;
-					pin3 = (splittedData[3]).Contains("1")) ? true : false;
-					//....so on and so forth.
-
-                    missedInputs = 0;
-                } else if (s == null) {
-                    missedInputs++;
-                    if (missedInputs > 1000) {
-                        Debug.Log("-ArduinoManager- Arduino has become unreachable. Reconnecting now");
-                        //TODO
-                    }
-                }
-                Thread.Sleep(5); //Same reasoning as before
-            }
+                //seriale.Close();
+                //seriale.Dispose();
+                has_Connected = false;
+                Utilities.LogD(TAG,"arduino disconesso, tento la riconnessione...");
+            } while (true);
         }
 
         //---------------------------------------------------------------------------------- FUNZIONI PUBBLICHE
 
         /// <summary>
-        /// Obtains current command
+        /// Invia dal thread corrente un comando ad Arduino
         /// </summary>
-        public string getCommand() { return currentCommand; }
-
-        /// <summary>
-        /// get for the pin
-        /// </summary>
-        public bool getPin0() { return pin0; }
-
-        /// <summary>
-        /// Sets the string to send to Arduino.
-        /// </summary>
-        public void Send(string Value) { outgoing = Value; }
-
-        //---------------------------------------------------------------------------------- FUNZIONI DI UNITY
-
-        private void Awake() {
-
-            //Singleton check
-            if (Instance == null)
-                Instance = this;
-            else if (Instance != this)
-                Destroy(this);
-
-            //Persists between scenes
-            DontDestroyOnLoad(this);
-
-            connessione = new Thread(new ThreadStart(MultithreadedConnection));
-            connessione.Start();
-            inputParser = new Thread(new ThreadStart(MultithreadedParseInput));
-            inputParser.Start();
+        /// <param name="Value">Il comando da inviare</param>
+        public static void Send(string Value) {
+            if (!has_Started || !has_Connected) {
+                Utilities.LogE(TAG, "Errore: tentato di inviare il comando [" + Value + "] ad arduino senza avere la connessione.");
+                return;
+            }
+            seriale.Write(Value);
         }
 
-        private void OnApplicationQuit() {
-
-            if (connessione != null || connessione.ThreadState.Equals(ThreadState.Running)) {
-                Debug.LogWarning("Annullamento thread [" + connessione.ManagedThreadId + "]");
-                connessione.Abort();
+        /// <summary>
+        /// Invia dal thread corrente un comando ad Arduino
+        /// </summary>
+        /// <param name="Value">Il comando da inviare</param>
+        public static void Send(int Value) {
+            if (!has_Started || !has_Connected) {
+                Utilities.LogE(TAG, "Errore: tentato di inviare il comando [" + Value + "] ad arduino senza avere la connessione.");
+                return;
             }
+            seriale.Write(Value.ToString());
+        }
 
-            Debug.LogWarning("Annullamento thread [" + inputParser.ManagedThreadId + "]");
-            inputParser.Abort();
+        /// <summary>
+        /// Invia dal thread dell'ArduinoManager un comando ad Arduino in asincrono.
+        /// </summary>
+        /// <param name="Value">Il comando da inviare</param>
+        public static void SendAsync(string Value) { outgoingQueue.Enqueue(Value); }
 
-            //Invio il segnale ad arduino per resettarsi (usato molto raramente, serve giusto per assicurarsi che arduino rifaccia l'handshake, visto che l'app si sta chiudendo).
-            char c = 'R';
-            seriale.Write(c.ToString());
+        /// <summary>
+        /// Invia dal thread dell'ArduinoManager un comando ad Arduino in asincrono.
+        /// </summary>
+        /// <param name="Value">Il comando da inviare</param>
+        public static void SendAsync(int Value) { outgoingQueue.Enqueue(Value.ToString()); }
+
+
+        /// <summary>
+        /// Avvia la connessione ad Arduino tramite thread.
+        /// </summary>
+        public static void Start() {
+            threadedConnection = new Thread(new ThreadStart(ThreadedConnection));
+            threadedConnection.Start();
+            has_Started = true;
+        }
+
+        /// <summary>
+        /// Ferma la connessione ad Arduino.
+        /// </summary>
+        public static void Stop() {
+            threadedConnection.Abort();
             seriale.Close();
+            has_Started = false;
         }
     }
 
