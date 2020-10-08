@@ -21,9 +21,9 @@ public class Utilities : Application {
     public const string AppName = "AmazingApp";
 
     //Percorsi
-    private const string androidBaseApplicationDir = @"sdcard/REPLAYSRL/" + AppName + "/";
-    private const string officeBaseApplicationDir = @"D:/ProgettiAlessandro/tmp/REPLAYSRL/" + AppName + "/";
-    private const string homeBaseApplicationDir = @"Q:/tmp/REPLAYSRL/" + AppName + "/";
+    private const string androidBaseApplicationDir = @"sdcard/" + AppName + "/";
+    private const string officeBaseApplicationDir = @"D:/tmp/" + AppName + "/";
+    private const string homeBaseApplicationDir = @"Q:/tmp/" + AppName + "/";
 #if UNITY_EDITOR && IS_HOME
     public const string BaseApplicationDir = homeBaseApplicationDir;
 #elif UNITY_EDITOR && !IS_HOME
